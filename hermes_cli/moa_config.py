@@ -228,8 +228,8 @@ def _clean_slot(slot: Any, *, include_enabled: bool = False) -> dict[str, Any] |
     #     stock guardrails.
     #
     # Purpose is response diversity. Stock MoA sends every reference the same
-    # framing, so N models return N correlated restatements (PRISM,
-    # arXiv:2602.08586: error correlation breaks on role diversity, not count).
+    # framing, so N models return N correlated restatements — role
+    # differentiation is what makes selection between them meaningful.
     # ``context_command``: host command run at fan-out whose stdout is appended
     # last — real retrieved evidence for an advisor that cannot call tools.
     _cc = slot.get("context_command")
