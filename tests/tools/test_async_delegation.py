@@ -729,3 +729,160 @@ def test_gateway_cli_origin_event_left_unrouted():
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
 
+
+
+# ---------------------------------------------------------------------------
+# Defect-B regressions: batch status propagation for failed children
+# ---------------------------------------------------------------------------
+
+def _batch_runner(results, duration=3.0):
+    """Runner closure returning a combined batch results dict."""
+    def runner():
+        return {
+            "results": results,
+            "total_duration_seconds": duration,
+        }
+    return runner
+
+
+def _error_result(idx, status_text):
+    return {
+        "task_index": idx,
+        "status": "error",
+        "summary": status_text,
+        "error": status_text,
+        "exit_reason": "error",
+        "api_calls": 1,
+        "duration_seconds": 0.5,
+    }
+
+
+def test_all_error_batch_status_error_without_success_markers():
+    """Three children all rejected with HTTP 401 → the batch itself must be
+    status=error, every task must render with a failure marker (never ✓),
+    and the sanitized errors must be visible in the completion block."""
+    results = [
+        _error_result(0, "HTTP 401: Invalid API key 'sk-fake-test-key-1234567890'"),
+        _error_result(1, "HTTP 401: Invalid API key 'sk-fake-test-key-1234567890'"),
+        _error_result(2, "HTTP 401: Invalid API key 'sk-fake-test-key-1234567890'"),
+    ]
+    res = ad.dispatch_async_delegation_batch(
+        goals=["g0", "g1", "g2"], context=None, toolsets=None, role="leaf",
+        model="m", session_key="", runner=_batch_runner(results),
+        max_async_children=3,
+    )
+    assert res["status"] == "dispatched"
+
+    evt = _drain_for(res["delegation_id"])
+    assert evt is not None
+    assert evt["type"] == "async_delegation"
+    assert evt["is_batch"] is True
+    # Batch status: every child failed → error.
+    assert evt["status"] == "error"
+
+    text = format_process_notification(evt)
+    assert "BATCH ERROR" in text
+    # No success marker anywhere; exactly one failure marker per task.
+    assert "✓" not in text
+    assert text.count("✗") == 3
+    # Sanitized child errors are surfaced; raw key material is not.
+    assert "HTTP 401" in text
+    assert "sk-fake-test-key" not in text
+
+
+def test_mixed_batch_completes_but_failures_stay_visible():
+    """Mixed batch (1 usable child, 2 rejected): documented policy — the
+    batch completes, but the per-child block still marks the failures with
+    ✗ and surfaces their errors."""
+    results = [
+        {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "PONG-0",
+            "api_calls": 1,
+            "duration_seconds": 0.5,
+            "exit_reason": "completed",
+        },
+        _error_result(1, "HTTP 401: Invalid API key"),
+        _error_result(2, "HTTP 500: upstream overloaded"),
+    ]
+    res = ad.dispatch_async_delegation_batch(
+        goals=["g0", "g1", "g2"], context=None, toolsets=None, role="leaf",
+        model="m", session_key="", runner=_batch_runner(results),
+        max_async_children=3,
+    )
+    assert res["status"] == "dispatched"
+
+    evt = _drain_for(res["delegation_id"])
+    assert evt is not None
+    assert evt["status"] == "completed"  # at least one child produced output
+
+    text = format_process_notification(evt)
+    assert "BATCH COMPLETE" in text
+    assert "✓" in text and "✗" in text
+    assert text.count("✗") == 2
+    assert "PONG-0" in text
+    assert "(error: HTTP 401" in text
+    assert "(error: HTTP 500" in text
+
+
+def test_completion_event_surfaces_sanitized_child_errors():
+    """Batch completion events carry a per-child error field so consumers
+    (UI, manifest, re-entry block) see the sanitized failure text."""
+    results = [_error_result(0, "HTTP 401: Invalid API key 'sk-fake-test-key-1234567890'")]
+    res = ad.dispatch_async_delegation_batch(
+        goals=["g0"], context=None, toolsets=None, role="leaf",
+        model="m", session_key="", runner=_batch_runner(results),
+        max_async_children=3,
+    )
+    assert res["status"] == "dispatched"
+
+    evt = _drain_for(res["delegation_id"])
+    assert evt is not None
+    child = evt["results"][0]
+    assert child["status"] == "error"
+    assert child["exit_reason"] == "error"
+    # The completion event surfaces the per-child error...
+    assert "HTTP 401" in child["error"]
+    # ...and the re-injection block that enters the parent's context never
+    # carries raw key material, even when the runner built the error string
+    # outside delegate_tool's classification-time sanitizer.
+    text = format_process_notification(evt)
+    assert "HTTP 401" in text
+    assert "sk-fake-test-key" not in text
+
+
+def test_manifest_never_calls_failed_tasks_completed():
+    """The live manifest must copy the truthful per-task status — a failed
+    child can never be labelled completed."""
+    from tools.delegation_live_log import (
+        create_live_transcripts,
+        live_transcript_root,
+        update_manifest_statuses,
+    )
+
+    delegation_id, _writers, _paths = create_live_transcripts(
+        [{"goal": "a"}, {"goal": "b"}, {"goal": "c"}],
+        delegation_id="deleg_fail_class_test",
+    )
+    try:
+        update_manifest_statuses(delegation_id, [
+            {"task_index": 0, "status": "completed", "exit_reason": "completed"},
+            {"task_index": 1, "status": "error", "exit_reason": "error"},
+            {"task_index": 2, "status": "error", "exit_reason": "error"},
+        ])
+        manifest = json.loads(
+            (live_transcript_root() / delegation_id / "manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        by_index = {t["index"]: t for t in manifest["tasks"]}
+        assert by_index[0]["status"] == "completed"
+        assert by_index[0]["exit_reason"] == "completed"
+        assert by_index[1]["status"] == "error"
+        assert by_index[1]["exit_reason"] == "error"
+        assert by_index[2]["status"] == "error"
+        assert by_index[2]["exit_reason"] == "error"
+    finally:
+        import shutil
+        shutil.rmtree(live_transcript_root() / delegation_id, ignore_errors=True)

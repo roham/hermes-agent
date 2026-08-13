@@ -967,7 +967,14 @@ def dispatch_async_delegation_batch(
         status = "error"
         try:
             combined = runner() or {}
-            # Batch status: completed unless every child errored/was interrupted.
+            # Batch status policy: "error" when EVERY child failed (status
+            # outside ("completed", "success") — "success" is accepted as a
+            # synonym for callers that emit it; delegate_tool emits
+            # "completed"/"error"/"failed"/"interrupted").  A mixed batch
+            # (at least one usable child) completes, but the per-child
+            # results block below still renders every failure with an ✗
+            # marker and its sanitized error, so partial failure is never
+            # hidden behind the batch status.
             child_results = combined.get("results") or []
             if child_results and all(
                 (r.get("status") not in ("completed", "success"))

@@ -2186,6 +2186,26 @@ def _format_age(seconds: float) -> str:
     return f"{h}h" if m == 0 else f"{h}h{m}m"
 
 
+def _sanitize_event_error(text: Any) -> str:
+    """Redact credentials from an error string about to enter the model's
+    context.
+
+    Classification-time sanitization in delegate_tool is the primary guard;
+    this is defense in depth for error strings built OUTSIDE that path
+    (runner/worker exception strings, interrupt messages, legacy persisted
+    events), which can echo an API key (``HTTP 401: Invalid API key
+    'sk-...'``).  Best-effort: never raises, never alters non-secret text.
+    """
+    if not text:
+        return ""
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(str(text), force=True) or str(text)
+    except Exception:  # pragma: no cover - redactor missing: degrade
+        return str(text)
+
+
 def _format_async_delegation(evt: dict) -> str:
     """Format an async-delegation completion into a self-contained re-injection.
 
@@ -2206,7 +2226,7 @@ def _format_async_delegation(evt: dict) -> str:
     model = evt.get("model") or "?"
     status = evt.get("status") or "completed"
     summary = evt.get("summary")
-    error = evt.get("error")
+    error = _sanitize_event_error(evt.get("error")) or None
     api_calls = evt.get("api_calls", 0)
     duration = evt.get("duration_seconds", "?")
     dispatched_at = evt.get("dispatched_at")
@@ -2222,8 +2242,13 @@ def _format_async_delegation(evt: dict) -> str:
         goals = evt.get("goals") or []
         n = len(results) if results else len(goals)
         total_dur = evt.get("total_duration_seconds", duration)
+        _batch_label = (
+            "BATCH COMPLETE"
+            if str(status).lower() in ("completed", "success")
+            else f"BATCH {str(status).upper()}"
+        )
         lines = [
-            f"[ASYNC DELEGATION BATCH COMPLETE — {deleg_id}]",
+            f"[ASYNC DELEGATION {_batch_label} — {deleg_id}]",
             f"A background fan-out of {n} subagent(s) you dispatched earlier "
             "has finished. All ran in parallel and waited on each other; their "
             "consolidated results are below. You may have moved on since "
@@ -2247,7 +2272,7 @@ def _format_async_delegation(evt: dict) -> str:
             idx = r.get("task_index", 0)
             r_status = r.get("status", "?")
             r_summary = r.get("summary")
-            r_error = r.get("error")
+            r_error = _sanitize_event_error(r.get("error")) or None
             r_goal = goals[idx] if idx < len(goals) else r.get("goal", "")
             icon = "✓" if r_status in ("completed", "success") else "✗"
             lines.append("")
@@ -2263,7 +2288,17 @@ def _format_async_delegation(evt: dict) -> str:
             lines.append(header)
             if r_status in ("completed", "success") and r_summary:
                 lines.append(r_summary)
+            elif r_status in ("error", "failed"):
+                # Failure: surface the SANITIZED error.  A summary that is
+                # itself the failure text (e.g. "HTTP 401: ...") is already
+                # covered by r_error — never paste raw provider output a
+                # second time.
+                if r_error:
+                    lines.append(f"({r_status}: {r_error})")
+                else:
+                    lines.append(f"(no summary — status={r_status})")
             elif r_summary:
+                # interrupted / timeout / unknown with partial work
                 if r_error:
                     lines.append(f"({r_status}: {r_error})")
                 lines.append("Partial output:")
@@ -2285,8 +2320,13 @@ def _format_async_delegation(evt: dict) -> str:
     if isinstance(dispatched_at, (int, float)):
         age = f" ({_format_age(completed_at - dispatched_at)} ago)"
 
+    _single_label = (
+        "COMPLETE"
+        if str(status).lower() in ("completed", "success")
+        else str(status).upper()
+    )
     lines = [
-        f"[ASYNC DELEGATION COMPLETE — {deleg_id}]",
+        f"[ASYNC DELEGATION {_single_label} — {deleg_id}]",
         "A background subagent you dispatched earlier has finished. You may "
         "have moved on since dispatching it; the full task source is below so "
         "you can act on the result or re-dispatch if things have changed.",
@@ -2319,7 +2359,11 @@ def _format_async_delegation(evt: dict) -> str:
             f"The subagent did not complete successfully (status={status})."
             + (f"\n{error}" if error else "")
         )
-        if summary:
+        # Only paste a raw summary when it is not the failure text itself
+        # (a provider HTTP 401 string is already surfaced via ``error``).
+        # Compare sanitized forms: the raw summary may differ from the
+        # redacted error only by the leaked credential.
+        if summary and _sanitize_event_error(summary) != error:
             lines.append("Partial output:")
             lines.append(summary)
     return "\n".join(lines)

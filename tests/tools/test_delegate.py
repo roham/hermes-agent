@@ -492,6 +492,125 @@ class TestDelegateObservability(unittest.TestCase):
             self.assertEqual(result["results"][0]["status"], "failed")
 
 
+class TestChildFailureClassification(unittest.TestCase):
+    """Defect-A regressions: provider/transport failures must classify as
+    status="error" / exit_reason="error" with a sanitized error surfaced —
+    never as status="completed" with exit_reason="max_iterations".
+
+    A rejected child's final_response is often the raw provider error string
+    ("HTTP 401: ..."); the turn finalizer additionally stamps structured
+    failure fields (``error`` / ``failed`` / ``turn_exit_reason``). Both
+    signals must win over the summary-present heuristic."""
+
+    def _delegate_single(self, result_dict, max_iterations=None):
+        parent = _make_mock_parent(depth=0)
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "test-model"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            if max_iterations is not None:
+                mock_child.max_iterations = max_iterations
+            mock_child.run_conversation.return_value = result_dict
+            MockAgent.return_value = mock_child
+            return json.loads(
+                delegate_task(goal="Test child classification", parent_agent=parent)
+            )["results"][0]
+
+    def test_http_401_final_response_classifies_error(self):
+        """A provider rejection string surfaced as final_response must be
+        status=error, exit_reason=error, with the sanitized error surfaced —
+        and the raw string (which may echo a credential) must not reach the
+        parent's context."""
+        entry = self._delegate_single({
+            "final_response": (
+                "HTTP 401: Invalid API key 'sk-fake-test-key-1234567890' "
+                "for provider fireworks"
+            ),
+            "completed": False,
+            "interrupted": False,
+            "api_calls": 2,
+            "messages": [],
+        })
+        self.assertEqual(entry["status"], "error")
+        self.assertEqual(entry["exit_reason"], "error")
+        self.assertIn("HTTP 401", entry["error"])
+        # Sanitized: the provider echoed the key back; it must not survive
+        # in the result or the summary handed to the parent.
+        self.assertNotIn("sk-fake-test-key", entry["error"])
+        self.assertNotIn("sk-fake-test-key", entry.get("summary") or "")
+
+    def test_http_500_prefix_classifies_error(self):
+        entry = self._delegate_single({
+            "final_response": "HTTP 500: upstream overloaded",
+            "completed": False,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+        })
+        self.assertEqual(entry["status"], "error")
+        self.assertEqual(entry["exit_reason"], "error")
+        self.assertIn("HTTP 500", entry["error"])
+
+    def test_structured_provider_error_key_classifies_error(self):
+        """A structured failure (error key + failed flag + error-marked
+        turn_exit_reason) classifies as error even when the summary text is
+        not itself error-looking."""
+        entry = self._delegate_single({
+            "final_response": (
+                "Invalid API response after 3 retries: HTTP 401 Unauthorized"
+            ),
+            "completed": False,
+            "interrupted": False,
+            "failed": True,
+            "error": (
+                "Invalid API response after 3 retries: HTTP 401 Unauthorized"
+            ),
+            "turn_exit_reason": "error_near_max_iterations(HTTP 401 Unauthorized)",
+            "api_calls": 3,
+            "messages": [],
+        })
+        self.assertEqual(entry["status"], "error")
+        self.assertEqual(entry["exit_reason"], "error")
+        self.assertIn("HTTP 401", entry["error"])
+
+    def test_real_iteration_cap_keeps_summary_and_honest_exit_reason(self):
+        """A child that hit a REAL iteration cap after producing substantive
+        output keeps its summary; exit_reason reports the cap, not an
+        invented error."""
+        entry = self._delegate_single({
+            "final_response": (
+                "Completed the research pass; hit the iteration budget "
+                "while writing up the full report."
+            ),
+            "completed": False,
+            "interrupted": False,
+            "api_calls": 12,
+            "turn_exit_reason": "max_iterations_reached(12/12)",
+            "messages": [],
+        })
+        self.assertEqual(entry["status"], "completed")
+        self.assertEqual(entry["exit_reason"], "max_iterations")
+        self.assertIn("Completed the research pass", entry["summary"])
+
+    def test_iteration_cap_fallback_from_api_call_count(self):
+        """Legacy result dicts without turn_exit_reason still get an honest
+        max_iterations exit when api_calls consumed the child's budget."""
+        entry = self._delegate_single(
+            {
+                "final_response": "Partial work done",
+                "completed": False,
+                "interrupted": False,
+                "api_calls": 10,
+                "messages": [],
+            },
+            max_iterations=10,
+        )
+        self.assertEqual(entry["status"], "completed")
+        self.assertEqual(entry["exit_reason"], "max_iterations")
+        self.assertIn("Partial work done", entry["summary"])
+
+
 class TestSubagentCostRollup(unittest.TestCase):
     """Port of Kilo-Org/kilocode#9448 — parent's session_estimated_cost_usd
     must include subagent spend, not just the parent's own API calls."""

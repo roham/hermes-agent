@@ -435,6 +435,12 @@ def _looks_like_error_output(content: Any) -> bool:
       - structured JSON with an ``error`` key
       - structured JSON with ``status`` of error/failed
       - first line starts with a classic error marker
+      - first line starts with an ``HTTP 4xx/5xx`` status — provider
+        transport failures surface verbatim as the child's final response
+        ("HTTP 401: The API key ... is invalid"), and must never be
+        mistaken for usable output.  Covers both concrete codes
+        ("http 401:") and the literal "http 4xx:" prefix used by some
+        adapters.
     """
     content = _stringify_tool_content(content)
     if not content:
@@ -459,6 +465,7 @@ def _looks_like_error_output(content: Any) -> bool:
         or first.startswith("failed:")
         or first.startswith("traceback ")
         or first.startswith("exception:")
+        or first.startswith(("http 4", "http 5"))
     )
 
 
@@ -477,6 +484,81 @@ def _normalize_role(r: Optional[str]) -> str:
         return r_norm
     logger.warning("Unknown delegate_task role=%r, coercing to 'leaf'", r)
     return "leaf"
+
+
+def _child_result_error(result: Dict[str, Any], summary: str) -> Optional[str]:
+    """Best-effort extraction of a sanitized child failure description.
+
+    Returns ``None`` when the result carries NO failure evidence.  Evidence,
+    in order of authority:
+
+      1. an explicit ``error`` key — stamped by the turn finalizer on
+         truncation, invalid-tool exhaustion, session-persistence failures,
+         and other aborted-turn paths;
+      2. the ``failed`` flag — ``agent/turn_finalizer.finalize_turn`` only
+         sets it on provider/policy/transport failures;
+      3. a ``turn_exit_reason`` with a known error marker, so results that
+         predate the ``error`` key still classify correctly;
+      4. a final response whose first line matches
+         ``_looks_like_error_output`` — including the ``HTTP 4xx/5xx:``
+         provider-rejection strings some transports surface verbatim
+         instead of raising.
+
+    The returned string is bounded and run through the shared secret
+    redactor so a provider error that echoes an API key (e.g. ``HTTP 401:
+    Invalid API key 'sk-...'``) never reaches the parent's context or the
+    completion event.
+    """
+    raw: Any = None
+    if result.get("error"):
+        raw = result["error"]
+    elif result.get("failed"):
+        raw = summary or str(result.get("turn_exit_reason") or "") or None
+    else:
+        reason = str(result.get("turn_exit_reason") or "")
+        if reason.startswith(
+            ("error_", "local_processing_error", "session_persistence_failed")
+        ):
+            raw = summary or reason
+        elif summary and _looks_like_error_output(summary):
+            raw = summary
+    if raw is None or not str(raw).strip():
+        return None
+    text = str(raw).strip()
+    if len(text) > 800:
+        text = text[:500] + " ... [truncated] ... " + text[-240:]
+    try:
+        from agent.redact import redact_sensitive_text
+
+        text = redact_sensitive_text(text, force=True) or text
+    except Exception:
+        pass  # redactor unavailable — the bounded text is already a downgrade
+    return text
+
+
+def _child_budget_consumed(
+    result: Dict[str, Any], api_calls: Any, child: Any
+) -> bool:
+    """True when the child exhausted its own iteration budget.
+
+    ``agent/turn_finalizer.finalize_turn`` stamps ``turn_exit_reason`` with
+    ``max_iterations_reached(N/M)`` / ``budget_exhausted`` when the loop left
+    because the cap was hit — that is authoritative.  Legacy or synthetic
+    result dicts without a reason fall back to ``api_calls >=
+    child.max_iterations`` when the child exposes its budget.
+    """
+    reason = str(result.get("turn_exit_reason") or "")
+    if "max_iterations_reached" in reason or "budget_exhausted" in reason:
+        return True
+    try:
+        max_iter = getattr(child, "max_iterations", None)
+    except Exception:
+        max_iter = None
+    return (
+        isinstance(max_iter, int)
+        and isinstance(api_calls, (int, float))
+        and api_calls >= max_iter
+    )
 
 
 def _get_max_concurrent_children() -> int:
@@ -2320,12 +2402,28 @@ def _run_single_child(
         # it instead of silently accepting zero-content "success".
         _empty_sentinel = summary.strip() == "(empty)"
 
+        # Provider/transport failures must NEVER be promoted to "completed".
+        # A rejected child's final_response is often the raw error string
+        # itself ("HTTP 401: Invalid API key ..."), and the turn finalizer
+        # stamps structured failure fields (``error`` / ``failed`` /
+        # ``turn_exit_reason``) on its failure paths — both are checked
+        # here so status mirrors what actually happened.
+        _child_error = _child_result_error(result, summary)
+
         if interrupted:
             status = "interrupted"
+        elif _child_error:
+            status = "error"
         elif summary and not _empty_sentinel:
             # A summary means the subagent produced usable output.
             # exit_reason ("completed" vs "max_iterations") already
             # tells the parent *how* the task ended.
+            #
+            # Classification policy: a child that hit a REAL iteration cap
+            # but still produced substantive output keeps status
+            # "completed" with exit_reason "max_iterations".  The summary is
+            # usable work, the cap stays visible to the parent, and only
+            # genuine failure evidence (above) ever flips status to "error".
             status = "completed"
         else:
             status = "failed"
@@ -2368,12 +2466,22 @@ def _run_single_child(
                         # Fallback for messages without tool_call_id
                         tool_trace[-1].update(result_meta)
 
-        # Determine exit reason
+        # Determine exit reason. "max_iterations" is reserved for children
+        # that actually consumed their iteration budget — provider errors
+        # report exit_reason "error" so the parent can tell a rejected
+        # child apart from a budget-exhausted one.
         if interrupted:
             exit_reason = "interrupted"
+        elif _child_error:
+            exit_reason = "error"
         elif completed:
             exit_reason = "completed"
+        elif _child_budget_consumed(result, api_calls, child):
+            exit_reason = "max_iterations"
         else:
+            # Result dicts that predate turn_exit_reason carry no budget
+            # evidence; keep the historical fallback so legacy/synthetic
+            # callers behave unchanged.
             exit_reason = "max_iterations"
 
         # Extract token counts (safe for mock objects)
@@ -2416,7 +2524,16 @@ def _run_single_child(
                 else 0.0
             ),
         }
-        if status == "failed":
+        if status == "error":
+            entry["error"] = _child_error
+            # A rejected child's summary is usually the raw provider error
+            # string itself ("HTTP 401: ..."), which may echo a credential.
+            # Swap in the sanitized copy so the parent never sees the raw
+            # text; substantive partial output that is not error text is
+            # kept (it is real work, and the error field carries the cause).
+            if entry.get("summary") and _looks_like_error_output(entry["summary"]):
+                entry["summary"] = _child_error
+        elif status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
 
         # Cross-agent file-state reminder.  If this subagent wrote any
