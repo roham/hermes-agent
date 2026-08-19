@@ -5923,9 +5923,15 @@ def resolve_provider_client(
         custom_key = ""
         if explicit_base_url:
             custom_base = _to_openai_base_url(explicit_base_url).strip()
+            # Gate OPENAI_API_KEY on authoritative OpenAI hosts — otherwise the
+            # key leaks to any custom endpoint (e.g. api.fireworks.ai) whenever
+            # the profile .env exports it, shadowing the configured
+            # custom_providers api_key and producing instant 401s. Mirrors the
+            # #28660 gating in hermes_cli/runtime_provider.py.
+            _custom_is_openai_url = base_url_host_matches(custom_base, "openai.com") or base_url_host_matches(custom_base, "openai.azure.com")
             custom_key = (
                 (explicit_api_key or "").strip()
-                or os.getenv("OPENAI_API_KEY", "").strip()
+                or (os.getenv("OPENAI_API_KEY", "").strip() if _custom_is_openai_url else "")
                 or _read_main_api_key_if_same_host(custom_base)
                 or "no-key-required"  # local servers don't need auth
             )
