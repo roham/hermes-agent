@@ -6908,6 +6908,7 @@ def run_conversation(
                 try:
                     from agent.verification_stop import (
                         build_verify_on_stop_nudge,
+                        verification_interim_messages_enabled,
                         verify_on_stop_enabled,
                     )
 
@@ -6928,12 +6929,11 @@ def run_conversation(
                         getattr(agent, "_verification_stop_nudges", 0) + 1
                     )
                     final_msg["finish_reason"] = "verification_required"
-                    # The assistant response is real content — persist it and
-                    # emit to the UI as an interim message so the user sees the
-                    # attempted final answer before the verification loop runs.
-                    # Only the nudge is flagged synthetic so it gets stripped
-                    # from the durable transcript (#65919 §7).
-                    agent._emit_interim_assistant_message(final_msg)
+                    # Keep the attempted answer as a budget-exhaustion fallback.
+                    # When interim messages are disabled, buffer it until
+                    # verification completes so the UI gets one final answer.
+                    if verification_interim_messages_enabled():
+                        agent._emit_interim_assistant_message(final_msg)
                     messages.append(final_msg)
                     try:
                         agent._flush_messages_to_session_db(messages, conversation_history)
@@ -7000,12 +7000,10 @@ def run_conversation(
                 if _verify_nudge2:
                     agent._pre_verify_nudges = _attempt + 1
                     final_msg["finish_reason"] = "verify_hook_continue"
-                    # The assistant response is real content — persist it and
-                    # emit to the UI as an interim message so the user sees the
-                    # attempted final answer before the pre_verify loop runs.
-                    # Only the nudge is flagged synthetic so it gets stripped
-                    # from the durable transcript (#65919 §7).
-                    agent._emit_interim_assistant_message(final_msg)
+                    # Apply the same buffering policy to plugin-driven verify
+                    # continuations as to the built-in verify-on-stop path.
+                    if verification_interim_messages_enabled():
+                        agent._emit_interim_assistant_message(final_msg)
                     messages.append(final_msg)
                     try:
                         agent._flush_messages_to_session_db(messages, conversation_history)

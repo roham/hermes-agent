@@ -130,6 +130,28 @@ def verify_on_stop_enabled(config: dict[str, Any] | None = None) -> bool:
     return not _session_is_messaging_surface()
 
 
+def verification_interim_messages_enabled(
+    config: dict[str, Any] | None = None,
+) -> bool:
+    """Return whether verification candidates may be emitted before checks run."""
+    if config is None:
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            config = load_config_readonly()
+        except Exception:
+            config = {}
+    display_cfg = (config or {}).get("display") if isinstance(config, dict) else None
+    raw = (
+        display_cfg.get("interim_assistant_messages", True)
+        if isinstance(display_cfg, dict)
+        else True
+    )
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+
 def _candidate_cwds(paths: Iterable[str]) -> list[Path]:
     candidates: list[Path] = []
     seen: set[str] = set()
@@ -270,4 +292,8 @@ def build_verify_on_stop_nudge(
     )
 
 
-__all__ = ["build_verify_on_stop_nudge", "verify_on_stop_enabled"]
+__all__ = [
+    "build_verify_on_stop_nudge",
+    "verification_interim_messages_enabled",
+    "verify_on_stop_enabled",
+]

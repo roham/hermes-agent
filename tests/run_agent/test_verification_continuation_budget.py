@@ -1,5 +1,8 @@
 """End-to-end regression coverage for verification budget exhaustion (#61631, #65919 §7)."""
 
+import os
+from pathlib import Path
+
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -180,6 +183,91 @@ def test_multiple_verification_retries_publish_each_candidate_once(agent, monkey
     # The final response is the last candidate.
     assert result["final_response"] == "candidate three"
     assert result["turn_exit_reason"] == "text_response(finish_reason=stop)"
+    assert result["completed"] is True
+    agent._handle_max_iterations.assert_not_called()
+
+
+def test_verify_on_stop_buffers_candidate_when_interim_messages_disabled(
+    agent, monkeypatch
+):
+    """Verification still runs, but only the verified response reaches the UI."""
+    agent.max_iterations = 2
+    agent.iteration_budget.max_total = 2
+    answers = iter([
+        _response("premature report"),
+        _response("verified final report"),
+    ])
+    agent._interruptible_api_call = lambda _kwargs: next(answers)
+    agent._handle_max_iterations = MagicMock(return_value="replacement summary")
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
+
+    config_path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "display:\n  interim_assistant_messages: false\n",
+        encoding="utf-8",
+    )
+
+    emitted = []
+    agent.interim_assistant_callback = lambda text, **kw: emitted.append(text)
+
+    with (
+        patch(
+            "agent.verification_stop.build_verify_on_stop_nudge",
+            side_effect=["verify it", None],
+        ),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("edit changed.py")
+
+    assert emitted == []
+    assert result["final_response"] == "verified final report"
+    assert result["completed"] is True
+    agent._handle_max_iterations.assert_not_called()
+
+
+def test_pre_verify_buffers_candidate_when_interim_messages_disabled(
+    agent, monkeypatch
+):
+    """Plugin verification also stays internal until its final response."""
+    agent.max_iterations = 2
+    agent.iteration_budget.max_total = 2
+    answers = iter([
+        _response("premature report"),
+        _response("verified final report"),
+    ])
+
+    def model_call(_api_kwargs):
+        agent._turn_file_mutation_paths = {"changed.py"}
+        return next(answers)
+
+    agent._interruptible_api_call = model_call
+    agent._handle_max_iterations = MagicMock(return_value="replacement summary")
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    config_path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "display:\n  interim_assistant_messages: false\n",
+        encoding="utf-8",
+    )
+
+    emitted = []
+    agent.interim_assistant_callback = lambda text, **kw: emitted.append(text)
+
+    with (
+        patch("hermes_cli.plugins.has_hook", side_effect=lambda name: name == "pre_verify"),
+        patch(
+            "hermes_cli.plugins.get_pre_verify_continue_message",
+            side_effect=["run project tests", None],
+        ),
+        patch("agent.verify_hooks.max_verify_nudges", return_value=2),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("edit changed.py")
+
+    assert emitted == []
+    assert result["final_response"] == "verified final report"
     assert result["completed"] is True
     agent._handle_max_iterations.assert_not_called()
 

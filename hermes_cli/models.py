@@ -4844,7 +4844,7 @@ def validate_requested_model(
                 }
 
             # Auto-correct if the top match is very similar (e.g. typo)
-            auto = get_close_matches(requested_for_lookup, api_models, n=1, cutoff=0.9)
+            auto = get_close_matches(requested_for_lookup, api_models, n=1, cutoff=0.95)
             if auto:
                 return {
                     "accepted": True,
@@ -5072,7 +5072,7 @@ def validate_requested_model(
                     "recognized": True,
                     "message": None,
                 }
-            auto = get_close_matches(requested_for_lookup, api_models, n=1, cutoff=0.9)
+            auto = get_close_matches(requested_for_lookup, api_models, n=1, cutoff=0.95)
             if auto:
                 return {
                     "accepted": True,
@@ -5124,7 +5124,7 @@ def validate_requested_model(
             # endpoints even though it's not in /models).  Warn but allow.
 
             # Auto-correct if the top match is very similar (e.g. typo)
-            auto = get_close_matches(requested_for_lookup, api_models, n=1, cutoff=0.9)
+            auto = get_close_matches(requested_for_lookup, api_models, n=1, cutoff=0.95)
             if auto:
                 return {
                     "accepted": True,
