@@ -268,7 +268,7 @@ def test_run_reference_command_only_falls_through_and_runs_command_once(monkeypa
     )
     monkeypatch.setattr(
         moa_loop, "_maybe_apply_moa_cache_control",
-        lambda messages, runtime: messages,
+        lambda messages, runtime, **kwargs: messages,
     )
 
     label, text, acct = moa_loop._run_reference(
@@ -314,7 +314,7 @@ def test_run_reference_failure_path_does_not_rerun_context_command(monkeypatch):
     monkeypatch.setattr(moa_loop, "call_llm", boom)
     monkeypatch.setattr(
         moa_loop, "_maybe_apply_moa_cache_control",
-        lambda messages, runtime: messages,
+        lambda messages, runtime, **kwargs: messages,
     )
 
     label, text, acct = moa_loop._run_reference(
